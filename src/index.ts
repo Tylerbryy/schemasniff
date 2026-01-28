@@ -19,23 +19,160 @@ function parseFieldTypes(value: string): FieldType[] {
   return types.filter(t => VALID_FIELD_TYPES.includes(t as FieldType)) as FieldType[];
 }
 
+const DESCRIPTION = `
+Automatically infer scraping schemas from web pages with repeated content.
+
+SchemaSniff analyzes a webpage's DOM to find repeated patterns (like product
+listings, article feeds, or table rows) and generates CSS selectors for
+extracting structured data.
+
+HOW IT WORKS:
+  1. Loads the page with Playwright (with optional JavaScript rendering)
+  2. Finds repeated DOM patterns by analyzing element classes
+  3. Scores patterns by item count, content diversity, and structure
+  4. Infers field types (text, links, prices, dates, images) from content
+  5. Outputs a YAML schema with CSS selectors ready for scraping
+
+FIELD TYPES:
+  text    - Plain text content
+  href    - Link URLs (from <a> elements)
+  url     - Image/resource URLs (from <img src>, etc.)
+  number  - Numeric values (integers, decimals)
+  date    - Date strings (2024-01-15, "January 3", etc.)
+  price   - Currency values ($99.99, £50, €100)
+
+PATTERN SCORING:
+  The tool automatically selects the best pattern using:
+  - Item count (more repeated items = higher score)
+  - Content diversity (penalizes identical content like nav links)
+  - Child count (prefers elements with rich nested content)
+  - DOM depth (prefers moderate depth, not too shallow/deep)
+`.trim();
+
+const EXAMPLES = `
+EXAMPLES:
+
+  Basic usage - analyze a page and output schema to stdout:
+    $ schemasniff https://news.ycombinator.com
+
+  Save schema to file:
+    $ schemasniff https://books.toscrape.com -o schema.yaml
+
+  Require at least 10 repeated items:
+    $ schemasniff https://example.com/products --min-items 10
+
+  Only detect prices and links:
+    $ schemasniff https://shop.example.com --type price,href
+
+  Skip JavaScript rendering (faster, for static sites):
+    $ schemasniff https://example.com --no-js
+
+  Manual container selector (when auto-detection fails):
+    $ schemasniff https://craigslist.org/search/sss --container ".gallery-card"
+
+  Lower confidence threshold (include uncertain fields):
+    $ schemasniff https://example.com --confidence 0.5
+
+EXAMPLE OUTPUT:
+
+  schema:
+    url: https://books.toscrape.com
+    generated: 2024-01-15T10:30:00.000Z
+    confidence: 0.94
+    item_count: 20
+  container: article.product_pod
+  fields:
+    - name: title
+      selector: article.product_pod a
+      type: text
+      confidence: 1
+      sample: "A Light in the Attic"
+    - name: price
+      selector: article.product_pod p.price_color
+      type: price
+      confidence: 1
+      sample: "£51.77"
+
+TIPS:
+
+  - Start with defaults, then adjust --min-items if too few/many results
+  - Use --container to override when auto-detection picks navigation
+  - Use --no-js for faster analysis on static HTML sites
+  - Pipe to jq or yq for post-processing: schemasniff URL | yq '.fields'
+`;
+
 const program = new Command();
 
 program
   .name('schemasniff')
-  .description('Auto-infer scraping schemas from pages with repeated content')
+  .description(DESCRIPTION)
   .version('0.1.0')
-  .argument('<url>', 'URL to analyze')
-  .option('--min-items <number>', 'Minimum repeated items to detect', '3')
-  .option('--depth <number>', 'Maximum DOM depth to analyze', '10')
-  .option('--type <types>', 'Field types to detect (comma-separated)', '')
-  .option('--include-empty', 'Include empty fields in schema', false)
-  .option('--js', 'Enable JavaScript rendering', true)
-  .option('--no-js', 'Disable JavaScript rendering')
-  .option('--confidence <number>', 'Minimum confidence threshold (0-1)', '0.7')
-  .option('-c, --container <selector>', 'Manual container selector (skip auto-detection)')
-  .option('-i, --interactive', 'Launch interactive TUI for schema refinement', false)
-  .option('-o, --output <file>', 'Output file path (default: stdout)')
+  .argument('<url>', 'The URL of the page to analyze')
+  .option(
+    '--min-items <n>',
+    'Minimum number of repeated items required to detect a pattern.\n' +
+    'Increase this to filter out small repeated elements (nav, footers).\n' +
+    'Decrease for pages with fewer items.',
+    '3'
+  )
+  .option(
+    '--depth <n>',
+    'Maximum DOM depth to consider for patterns.\n' +
+    'Elements deeper than this are ignored.\n' +
+    'Default (10) works for most sites.',
+    '10'
+  )
+  .option(
+    '--type <types>',
+    'Comma-separated list of field types to include.\n' +
+    'Available: text, href, url, number, date, price\n' +
+    'Default: all types. Example: --type price,href',
+    ''
+  )
+  .option(
+    '--include-empty',
+    'Include fields with empty values in the schema.\n' +
+    'By default, empty fields are excluded.',
+    false
+  )
+  .option(
+    '--js',
+    'Enable JavaScript rendering (default: enabled).\n' +
+    'Required for SPAs and dynamically-loaded content.',
+    true
+  )
+  .option(
+    '--no-js',
+    'Disable JavaScript rendering.\n' +
+    'Faster for static HTML sites. Uses domcontentloaded instead of networkidle.'
+  )
+  .option(
+    '--confidence <n>',
+    'Minimum confidence threshold (0-1) for including fields.\n' +
+    'Higher = stricter (fewer fields). Lower = more permissive.\n' +
+    'Confidence measures how consistently a field appears across items.',
+    '0.7'
+  )
+  .option(
+    '-c, --container <selector>',
+    'Manually specify the CSS selector for item containers.\n' +
+    'Skips automatic pattern detection entirely.\n' +
+    'Use when auto-detection picks the wrong elements (e.g., nav links).\n' +
+    'Example: --container "li.product-item" or --container ".gallery-card"'
+  )
+  .option(
+    '-i, --interactive',
+    'Launch interactive TUI for reviewing and refining the schema.\n' +
+    'Allows you to rename fields, remove unwanted fields, etc.',
+    false
+  )
+  .option(
+    '-o, --output <file>',
+    'Output file path for the generated schema.\n' +
+    'Default: stdout (prints to terminal).\n' +
+    'Example: -o schema.yaml'
+  )
+  .addHelpText('after', EXAMPLES)
   .action(async (url, options) => {
     try {
       console.error('🔍 Analyzing URL:', url);

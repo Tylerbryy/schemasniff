@@ -5,7 +5,39 @@ import { AnalyzerError } from './utils/errors.js';
 import { renderInteractive } from './ui.js';
 import { exportSchema } from './exporter.js';
 
+// ============================================================================
+// Input Validation
+// ============================================================================
+
 const VALID_FIELD_TYPES: FieldType[] = ['text', 'href', 'url', 'number', 'date', 'price'];
+
+function parsePositiveInt(value: string, name: string): number {
+  const parsed = parseInt(value, 10);
+  if (isNaN(parsed) || parsed < 1) {
+    console.error(`❌ ${name} must be a positive integer, got: "${value}"`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function parseConfidence(value: string): number {
+  const parsed = parseFloat(value);
+  if (isNaN(parsed) || parsed < 0 || parsed > 1) {
+    console.error(`❌ Confidence must be a number between 0 and 1, got: "${value}"`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function validateUrl(url: string): void {
+  try {
+    new URL(url);
+  } catch {
+    console.error(`❌ Invalid URL format: "${url}"`);
+    console.error('   URL must include protocol (e.g., https://example.com)');
+    process.exit(1);
+  }
+}
 
 function parseFieldTypes(value: string): FieldType[] {
   const types = value.split(',').map(t => t.trim().toLowerCase());
@@ -18,6 +50,36 @@ function parseFieldTypes(value: string): FieldType[] {
 
   return types.filter(t => VALID_FIELD_TYPES.includes(t as FieldType)) as FieldType[];
 }
+
+// ============================================================================
+// Logging (respects --quiet flag)
+// ============================================================================
+
+let quietMode = false;
+
+function log(message: string): void {
+  if (!quietMode) {
+    console.error(message);
+  }
+}
+
+// ============================================================================
+// Signal Handling
+// ============================================================================
+
+process.on('SIGINT', () => {
+  console.error('\n⚠️  Interrupted - cleaning up...');
+  process.exit(130);
+});
+
+process.on('SIGTERM', () => {
+  console.error('\n⚠️  Terminated - cleaning up...');
+  process.exit(143);
+});
+
+// ============================================================================
+// Help Text
+// ============================================================================
 
 const DESCRIPTION = `
 Automatically infer scraping schemas from web pages with repeated content.
@@ -73,6 +135,9 @@ EXAMPLES:
   Lower confidence threshold (include uncertain fields):
     $ schemasniff https://example.com --confidence 0.5
 
+  Quiet mode for scripting (no progress output):
+    $ schemasniff https://example.com --quiet -o schema.yaml
+
 EXAMPLE OUTPUT:
 
   schema:
@@ -98,8 +163,13 @@ TIPS:
   - Start with defaults, then adjust --min-items if too few/many results
   - Use --container to override when auto-detection picks navigation
   - Use --no-js for faster analysis on static HTML sites
+  - Use --quiet for scripting to suppress progress messages
   - Pipe to jq or yq for post-processing: schemasniff URL | yq '.fields'
 `;
+
+// ============================================================================
+// CLI Definition
+// ============================================================================
 
 const program = new Command();
 
@@ -132,18 +202,11 @@ program
   .option(
     '--include-empty',
     'Include fields with empty values in the schema.\n' +
-    'By default, empty fields are excluded.',
-    false
-  )
-  .option(
-    '--js',
-    'Enable JavaScript rendering (default: enabled).\n' +
-    'Required for SPAs and dynamically-loaded content.',
-    true
+    'By default, empty fields are excluded.'
   )
   .option(
     '--no-js',
-    'Disable JavaScript rendering.\n' +
+    'Disable JavaScript rendering (JS enabled by default).\n' +
     'Faster for static HTML sites. Uses domcontentloaded instead of networkidle.'
   )
   .option(
@@ -163,8 +226,7 @@ program
   .option(
     '-i, --interactive',
     'Launch interactive TUI for reviewing and refining the schema.\n' +
-    'Allows you to rename fields, remove unwanted fields, etc.',
-    false
+    'Allows you to rename fields, remove unwanted fields, etc.'
   )
   .option(
     '-o, --output <file>',
@@ -172,20 +234,36 @@ program
     'Default: stdout (prints to terminal).\n' +
     'Example: -o schema.yaml'
   )
+  .option(
+    '-q, --quiet',
+    'Suppress progress messages (errors still shown).\n' +
+    'Useful for scripting and piping output.'
+  )
   .addHelpText('after', EXAMPLES)
   .action(async (url, options) => {
+    // Set quiet mode first
+    quietMode = options.quiet ?? false;
+
+    // Validate URL early (fail fast)
+    validateUrl(url);
+
+    // Validate numeric options
+    const minItems = parsePositiveInt(options.minItems, '--min-items');
+    const maxDepth = parsePositiveInt(options.depth, '--depth');
+    const confidenceThreshold = parseConfidence(options.confidence);
+
     try {
-      console.error('🔍 Analyzing URL:', url);
+      log(`🔍 Analyzing URL: ${url}`);
 
       const fieldTypes = options.type ? parseFieldTypes(options.type) : [];
 
       const schema = await analyzeUrl(url, {
-        minItems: parseInt(options.minItems),
-        maxDepth: parseInt(options.depth),
+        minItems,
+        maxDepth,
         fieldTypes,
-        includeEmpty: options.includeEmpty,
-        enableJs: options.js,
-        confidenceThreshold: parseFloat(options.confidence),
+        includeEmpty: options.includeEmpty ?? false,
+        enableJs: options.js ?? true,
+        confidenceThreshold,
         containerSelector: options.container
       });
 
@@ -196,7 +274,7 @@ program
         await exportSchema(schema, options.output);
       }
 
-      console.error('✅ Schema generated successfully');
+      log('✅ Schema generated successfully');
     } catch (error) {
       if (error instanceof AnalyzerError) {
         console.error(`❌ [${error.code}] ${error.message}`);

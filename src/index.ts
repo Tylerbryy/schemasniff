@@ -1,8 +1,23 @@
 #!/usr/bin/env bun
 import { Command } from 'commander';
-import { analyzeUrl } from './analyzer.js';
+import { analyzeUrl, type FieldType } from './analyzer.js';
+import { AnalyzerError } from './utils/errors.js';
 import { renderInteractive } from './ui.js';
 import { exportSchema } from './exporter.js';
+
+const VALID_FIELD_TYPES: FieldType[] = ['text', 'href', 'url', 'number', 'date', 'price'];
+
+function parseFieldTypes(value: string): FieldType[] {
+  const types = value.split(',').map(t => t.trim().toLowerCase());
+  const invalid = types.filter(t => !VALID_FIELD_TYPES.includes(t as FieldType));
+
+  if (invalid.length > 0) {
+    console.error(`Warning: Invalid field types ignored: ${invalid.join(', ')}`);
+    console.error(`Valid types: ${VALID_FIELD_TYPES.join(', ')}`);
+  }
+
+  return types.filter(t => VALID_FIELD_TYPES.includes(t as FieldType)) as FieldType[];
+}
 
 const program = new Command();
 
@@ -13,7 +28,7 @@ program
   .argument('<url>', 'URL to analyze')
   .option('--min-items <number>', 'Minimum repeated items to detect', '3')
   .option('--depth <number>', 'Maximum DOM depth to analyze', '10')
-  .option('--type <types>', 'Field types to detect (comma-separated)', 'text,href,number,date,price')
+  .option('--type <types>', 'Field types to detect (comma-separated)', '')
   .option('--include-empty', 'Include empty fields in schema', false)
   .option('--js', 'Enable JavaScript rendering', true)
   .option('--no-js', 'Disable JavaScript rendering')
@@ -23,11 +38,13 @@ program
   .action(async (url, options) => {
     try {
       console.error('🔍 Analyzing URL:', url);
-      
+
+      const fieldTypes = options.type ? parseFieldTypes(options.type) : [];
+
       const schema = await analyzeUrl(url, {
         minItems: parseInt(options.minItems),
         maxDepth: parseInt(options.depth),
-        fieldTypes: options.type.split(','),
+        fieldTypes,
         includeEmpty: options.includeEmpty,
         enableJs: options.js,
         confidenceThreshold: parseFloat(options.confidence)
@@ -42,7 +59,11 @@ program
 
       console.error('✅ Schema generated successfully');
     } catch (error) {
-      console.error('❌ Error:', error instanceof Error ? error.message : String(error));
+      if (error instanceof AnalyzerError) {
+        console.error(`❌ [${error.code}] ${error.message}`);
+      } else {
+        console.error('❌ Error:', error instanceof Error ? error.message : String(error));
+      }
       process.exit(1);
     }
   });

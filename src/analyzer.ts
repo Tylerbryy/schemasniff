@@ -1,4 +1,4 @@
-import { chromium, type Page } from 'playwright';
+import { chromium, type Page, type Browser } from 'playwright';
 import { getInjectableUtilityLogic } from './utils/utility-classes.js';
 import { CONFIG } from './utils/constants.js';
 import { AnalyzerError } from './utils/errors.js';
@@ -16,6 +16,35 @@ export interface AnalyzerOptions {
   confidenceThreshold: number;
   /** Manual container selector override - skips automatic pattern detection */
   containerSelector?: string;
+  /** Custom navigation timeout in milliseconds */
+  timeout?: number;
+  /** CSS selectors to exclude from pattern detection */
+  excludeSelectors?: string[];
+  /** Wait for this selector before analyzing */
+  waitForSelector?: string;
+  /** Minimum number of child elements per item */
+  minChildren?: number;
+  /** Minimum text length per item */
+  minTextLength?: number;
+  /** Prioritize table-based patterns */
+  preferTable?: boolean;
+  /** Auto-exclude common navigation elements */
+  ignoreNav?: boolean;
+  /** Custom user agent string */
+  userAgent?: string;
+  /** Viewport dimensions */
+  viewport?: { width: number; height: number };
+  /** Cookies to set before navigation */
+  cookies?: Array<{
+    name: string;
+    value: string;
+    domain?: string;
+    path?: string;
+  }>;
+  /** Enable debug output */
+  debug?: boolean;
+  /** List top N patterns instead of just the best one */
+  listPatterns?: number;
 }
 
 export type FieldType = 'text' | 'href' | 'url' | 'number' | 'date' | 'price';
@@ -41,14 +70,39 @@ interface PatternSample {
   html: string;
   text: string | undefined;
   childCount: number;
+  textLength: number;
 }
 
-interface DOMPattern {
+export interface DOMPattern {
   selector: string;
   count: number;
   depth: number;
   samples: PatternSample[];
 }
+
+export interface ScoredPattern {
+  pattern: DOMPattern;
+  score: number;
+  diversityScore: number;
+  breakdown?: PatternScoreBreakdown;
+}
+
+export interface PatternScoreBreakdown {
+  countScore: number;
+  depthScore: number;
+  diversityScore: number;
+  childScore: number;
+  tableBonusScore: number;
+  anchorPenalty: number;
+  totalScore: number;
+}
+
+/** Common navigation selectors to exclude when --ignore-nav is enabled */
+const NAV_SELECTORS = [
+  'nav', 'header', 'footer', '.nav', '.navbar', '.navigation',
+  '.menu', '.sidebar', '.footer', '.header', '[role="navigation"]',
+  '[role="banner"]', '[role="contentinfo"]'
+];
 
 // ============================================================================
 // Main Entry Point
@@ -62,23 +116,48 @@ export async function analyzeUrl(url: string, options: AnalyzerOptions): Promise
     throw AnalyzerError.invalidUrl(url);
   }
 
-  let browser;
+  let browser: Browser;
   try {
     browser = await chromium.launch({ headless: true });
   } catch (e) {
     throw AnalyzerError.browserError(e);
   }
 
-  const page = await browser.newPage();
+  const context = await browser.newContext({
+    userAgent: options.userAgent,
+    viewport: options.viewport,
+  });
+
+  // Set cookies if provided
+  if (options.cookies && options.cookies.length > 0) {
+    const parsedUrl = new URL(url);
+    const cookiesWithDefaults = options.cookies.map(c => ({
+      ...c,
+      domain: c.domain || parsedUrl.hostname,
+      path: c.path || '/',
+    }));
+    await context.addCookies(cookiesWithDefaults);
+  }
+
+  const page = await context.newPage();
+  const timeout = options.timeout ?? CONFIG.NAVIGATION_TIMEOUT;
 
   try {
     const response = await page.goto(url, {
       waitUntil: options.enableJs ? 'networkidle' : 'domcontentloaded',
-      timeout: CONFIG.NAVIGATION_TIMEOUT
+      timeout
     });
 
     if (!response?.ok()) {
       throw AnalyzerError.pageLoadFailed(response?.status(), url);
+    }
+
+    // Wait for specific selector if requested
+    if (options.waitForSelector) {
+      if (options.debug) {
+        console.error(`⏳ Waiting for selector: ${options.waitForSelector}`);
+      }
+      await page.waitForSelector(options.waitForSelector, { timeout });
     }
 
     let bestPattern: DOMPattern | null;
@@ -94,6 +173,13 @@ export async function analyzeUrl(url: string, options: AnalyzerOptions): Promise
     } else {
       // Automatic pattern detection
       const patterns = await findRepeatedPatterns(page, options);
+
+      // Handle --list-patterns mode
+      if (options.listPatterns && options.listPatterns > 0) {
+        const scoredPatterns = scorePatterns(patterns, options);
+        printPatternList(scoredPatterns, options.listPatterns, options.debug ?? false);
+      }
+
       bestPattern = selectBestPattern(patterns, options);
 
       if (!bestPattern) {
@@ -134,6 +220,30 @@ export async function analyzeUrl(url: string, options: AnalyzerOptions): Promise
 }
 
 // ============================================================================
+// Pattern List Output
+// ============================================================================
+
+function printPatternList(patterns: ScoredPattern[], limit: number, debug: boolean): void {
+  console.error(`\n📊 Top ${Math.min(limit, patterns.length)} patterns:\n`);
+
+  patterns.slice(0, limit).forEach((sp, i) => {
+    const p = sp.pattern;
+    console.error(`  ${i + 1}. ${p.selector}`);
+    console.error(`     Items: ${p.count} | Depth: ${p.depth} | Score: ${sp.score.toFixed(1)}`);
+
+    if (debug && sp.breakdown) {
+      const b = sp.breakdown;
+      console.error(`     Breakdown: count=${b.countScore.toFixed(1)} depth=${b.depthScore.toFixed(1)} diversity=${b.diversityScore.toFixed(1)} children=${b.childScore.toFixed(1)} table=${b.tableBonusScore.toFixed(1)} anchor=${b.anchorPenalty.toFixed(1)}`);
+    }
+
+    // Show sample text
+    const sampleText = p.samples[0]?.text?.substring(0, 60) || '(no text)';
+    console.error(`     Sample: "${sampleText}${sampleText.length >= 60 ? '...' : ''}"`);
+    console.error('');
+  });
+}
+
+// ============================================================================
 // Manual Container Override
 // ============================================================================
 
@@ -156,7 +266,8 @@ async function getManualPattern(page: Page, selector: string): Promise<DOMPatter
       const samples = elements.slice(0, 5).map(el => ({
         html: el.outerHTML.substring(0, maxHtmlPreview),
         text: el.textContent?.substring(0, maxTextPreview),
-        childCount: el.children.length
+        childCount: el.children.length,
+        textLength: (el.textContent || '').trim().length
       }));
 
       return {
@@ -183,8 +294,14 @@ async function getManualPattern(page: Page, selector: string): Promise<DOMPatter
 async function findRepeatedPatterns(page: Page, options: AnalyzerOptions): Promise<DOMPattern[]> {
   const utilityLogic = getInjectableUtilityLogic();
 
+  // Build exclusion selectors
+  let excludeSelectors = options.excludeSelectors || [];
+  if (options.ignoreNav) {
+    excludeSelectors = [...excludeSelectors, ...NAV_SELECTORS];
+  }
+
   const patterns = await page.evaluate(
-    ({ minItems, maxHtmlPreview, maxTextPreview, containerTags, utilityLogic }) => {
+    ({ minItems, maxHtmlPreview, maxTextPreview, containerTags, utilityLogic, excludeSelectors, minChildren, minTextLength }) => {
       // Inject utility class detection logic
       eval(utilityLogic);
 
@@ -192,6 +309,24 @@ async function findRepeatedPatterns(page: Page, options: AnalyzerOptions): Promi
       const _getSemanticClasses = getSemanticClasses;
 
       const results: any[] = [];
+
+      // Build a set of elements to exclude
+      const excludedElements = new Set<Element>();
+      excludeSelectors.forEach((sel: string) => {
+        try {
+          document.querySelectorAll(sel).forEach(el => {
+            excludedElements.add(el);
+            // Also exclude all descendants
+            el.querySelectorAll('*').forEach(desc => excludedElements.add(desc));
+          });
+        } catch {
+          // Invalid selector, skip
+        }
+      });
+
+      function isExcluded(el: Element): boolean {
+        return excludedElements.has(el);
+      }
 
       function classIntersection(classes1: string[], classes2: string[]): string[] {
         const set2 = new Set(classes2);
@@ -209,12 +344,21 @@ async function findRepeatedPatterns(page: Page, options: AnalyzerOptions): Promi
       }
 
       containerTags.forEach((tag: string) => {
-        const elements = Array.from(document.querySelectorAll(tag));
+        const elements = Array.from(document.querySelectorAll(tag)).filter(el => !isExcluded(el));
         if (elements.length < minItems) return;
 
         const groups: { classes: string[]; elements: Element[] }[] = [];
 
         elements.forEach(el => {
+          // Filter by minChildren
+          if (minChildren !== undefined && el.children.length < minChildren) return;
+
+          // Filter by minTextLength
+          if (minTextLength !== undefined) {
+            const textLen = (el.textContent || '').trim().length;
+            if (textLen < minTextLength) return;
+          }
+
           const semanticClasses = _getSemanticClasses(el);
           if (semanticClasses.length === 0) return;
 
@@ -244,7 +388,8 @@ async function findRepeatedPatterns(page: Page, options: AnalyzerOptions): Promi
             const samples = group.elements.slice(0, 10).map(el => ({
               html: el.outerHTML.substring(0, maxHtmlPreview),
               text: el.textContent?.substring(0, maxTextPreview),
-              childCount: el.children.length
+              childCount: el.children.length,
+              textLength: (el.textContent || '').trim().length
             }));
 
             results.push({
@@ -264,7 +409,10 @@ async function findRepeatedPatterns(page: Page, options: AnalyzerOptions): Promi
       maxHtmlPreview: CONFIG.MAX_HTML_PREVIEW,
       maxTextPreview: CONFIG.MAX_TEXT_PREVIEW,
       containerTags: CONFIG.CONTAINER_TAGS,
-      utilityLogic
+      utilityLogic,
+      excludeSelectors,
+      minChildren: options.minChildren,
+      minTextLength: options.minTextLength
     }
   );
 
@@ -275,12 +423,12 @@ async function findRepeatedPatterns(page: Page, options: AnalyzerOptions): Promi
 // Pattern Scoring & Selection
 // ============================================================================
 
-function selectBestPattern(patterns: DOMPattern[], options: AnalyzerOptions): DOMPattern | null {
-  if (patterns.length === 0) return null;
+function scorePatterns(patterns: DOMPattern[], options: AnalyzerOptions): ScoredPattern[] {
+  if (patterns.length === 0) return [];
 
   // Filter by maxDepth
   const filtered = patterns.filter(p => p.depth <= options.maxDepth);
-  if (filtered.length === 0) return null;
+  if (filtered.length === 0) return [];
 
   const scored = filtered.map(p => {
     // Content diversity score (0-1) - calculate first
@@ -289,36 +437,89 @@ function selectBestPattern(patterns: DOMPattern[], options: AnalyzerOptions): DO
     // If diversity is very low (all identical content), this is likely nav/UI elements
     // Apply severe penalty that can't be overcome by count alone
     if (diversityScore < 0.2) {
-      return { pattern: p, score: -100, diversityScore }; // Effectively disqualify
+      return {
+        pattern: p,
+        score: -100,
+        diversityScore,
+        breakdown: options.debug ? {
+          countScore: 0,
+          depthScore: 0,
+          diversityScore: 0,
+          childScore: 0,
+          tableBonusScore: 0,
+          anchorPenalty: 0,
+          totalScore: -100
+        } : undefined
+      };
     }
 
-    let score = 0;
-
     // Count score (logarithmic - more items is better)
-    score += Math.log(p.count) * 10;
+    const countScore = Math.log(p.count) * 10;
 
     // Depth score (prefer moderate depth)
     const depthScore = Math.max(0, 10 - Math.abs(p.depth - CONFIG.IDEAL_DOM_DEPTH) * 2);
-    score += depthScore;
 
     // Diversity bonus (reward varied content)
-    score += diversityScore * 15;
+    const diversityBonusScore = diversityScore * 15;
 
     // Child count score (prefer elements with many children - actual content containers)
     // Nav links typically have 0-2 children, content cards have 3+
     const avgChildCount = p.samples.reduce((sum, s) => sum + s.childCount, 0) / p.samples.length;
-    const childScore = Math.min(avgChildCount / 3, 1) * 20; // Weight: 0-20 points (heavy)
-    score += childScore;
+    const childScore = Math.min(avgChildCount / 3, 1) * 20;
 
-    // Penalize anchor tags (usually navigation, not content containers)
-    if (p.selector.startsWith('a.')) {
-      score -= 15;
+    // Table bonus (when --prefer-table is enabled)
+    let tableBonusScore = 0;
+    if (options.preferTable) {
+      if (p.selector.startsWith('tr.') || p.selector.startsWith('tr ')) {
+        tableBonusScore = 25;
+      } else if (p.selector.includes('table') || p.selector.includes('tbody')) {
+        tableBonusScore = 15;
+      }
     }
 
-    return { pattern: p, score, diversityScore };
+    // Penalize anchor tags (usually navigation, not content containers)
+    let anchorPenalty = 0;
+    if (p.selector.startsWith('a.')) {
+      anchorPenalty = -15;
+    }
+
+    const totalScore = countScore + depthScore + diversityBonusScore + childScore + tableBonusScore + anchorPenalty;
+
+    return {
+      pattern: p,
+      score: totalScore,
+      diversityScore,
+      breakdown: options.debug ? {
+        countScore,
+        depthScore,
+        diversityScore: diversityBonusScore,
+        childScore,
+        tableBonusScore,
+        anchorPenalty,
+        totalScore
+      } : undefined
+    };
   });
 
   scored.sort((a, b) => b.score - a.score);
+
+  return scored;
+}
+
+function selectBestPattern(patterns: DOMPattern[], options: AnalyzerOptions): DOMPattern | null {
+  const scored = scorePatterns(patterns, options);
+  if (scored.length === 0) return null;
+
+  if (options.debug) {
+    const best = scored[0];
+    console.error(`\n🎯 Selected pattern: ${best.pattern.selector}`);
+    console.error(`   Score: ${best.score.toFixed(1)} | Items: ${best.pattern.count}`);
+    if (best.breakdown) {
+      const b = best.breakdown;
+      console.error(`   Breakdown: count=${b.countScore.toFixed(1)} depth=${b.depthScore.toFixed(1)} diversity=${b.diversityScore.toFixed(1)} children=${b.childScore.toFixed(1)} table=${b.tableBonusScore.toFixed(1)} anchor=${b.anchorPenalty.toFixed(1)}`);
+    }
+    console.error('');
+  }
 
   return scored[0].pattern;
 }

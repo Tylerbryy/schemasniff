@@ -33,6 +33,7 @@ program
   .option('--js', 'Enable JavaScript rendering', true)
   .option('--no-js', 'Disable JavaScript rendering')
   .option('--confidence <number>', 'Minimum confidence threshold (0-1)', '0.7')
+  .option('-c, --container <selector>', 'Manual container selector (skip auto-detection)')
   .option('-i, --interactive', 'Launch interactive TUI for schema refinement', false)
   .option('-o, --output <file>', 'Output file path (default: stdout)')
   .action(async (url, options) => {
@@ -47,7 +48,8 @@ program
         fieldTypes,
         includeEmpty: options.includeEmpty,
         enableJs: options.js,
-        confidenceThreshold: parseFloat(options.confidence)
+        confidenceThreshold: parseFloat(options.confidence),
+        containerSelector: options.container
       });
 
       if (options.interactive) {

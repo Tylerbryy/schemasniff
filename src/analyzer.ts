@@ -14,6 +14,8 @@ export interface AnalyzerOptions {
   includeEmpty: boolean;
   enableJs: boolean;
   confidenceThreshold: number;
+  /** Manual container selector override - skips automatic pattern detection */
+  containerSelector?: string;
 }
 
 export type FieldType = 'text' | 'href' | 'url' | 'number' | 'date' | 'price';
@@ -79,14 +81,24 @@ export async function analyzeUrl(url: string, options: AnalyzerOptions): Promise
       throw AnalyzerError.pageLoadFailed(response?.status(), url);
     }
 
-    // Find repeated patterns in the DOM
-    const patterns = await findRepeatedPatterns(page, options);
+    let bestPattern: DOMPattern | null;
 
-    // Select the most promising pattern
-    const bestPattern = selectBestPattern(patterns, options);
+    if (options.containerSelector) {
+      // Manual container override - skip pattern detection
+      console.error(`📦 Using manual container: ${options.containerSelector}`);
+      bestPattern = await getManualPattern(page, options.containerSelector);
 
-    if (!bestPattern) {
-      throw AnalyzerError.noPatternsFound(url, options.minItems);
+      if (!bestPattern) {
+        throw AnalyzerError.noPatternsFound(url, 1);
+      }
+    } else {
+      // Automatic pattern detection
+      const patterns = await findRepeatedPatterns(page, options);
+      bestPattern = selectBestPattern(patterns, options);
+
+      if (!bestPattern) {
+        throw AnalyzerError.noPatternsFound(url, options.minItems);
+      }
     }
 
     // Infer field types for the pattern
@@ -119,6 +131,49 @@ export async function analyzeUrl(url: string, options: AnalyzerOptions): Promise
   } finally {
     await browser.close();
   }
+}
+
+// ============================================================================
+// Manual Container Override
+// ============================================================================
+
+async function getManualPattern(page: Page, selector: string): Promise<DOMPattern | null> {
+  const pattern = await page.evaluate(
+    ({ selector, maxHtmlPreview, maxTextPreview }) => {
+      const elements = Array.from(document.querySelectorAll(selector));
+      if (elements.length === 0) return null;
+
+      function getDepth(el: Element): number {
+        let depth = 0;
+        let current: Element | null = el;
+        while (current && current.parentElement) {
+          depth++;
+          current = current.parentElement;
+        }
+        return depth;
+      }
+
+      const samples = elements.slice(0, 5).map(el => ({
+        html: el.outerHTML.substring(0, maxHtmlPreview),
+        text: el.textContent?.substring(0, maxTextPreview),
+        childCount: el.children.length
+      }));
+
+      return {
+        selector,
+        count: elements.length,
+        depth: getDepth(elements[0]),
+        samples
+      };
+    },
+    {
+      selector,
+      maxHtmlPreview: CONFIG.MAX_HTML_PREVIEW,
+      maxTextPreview: CONFIG.MAX_TEXT_PREVIEW
+    }
+  );
+
+  return pattern;
 }
 
 // ============================================================================
@@ -185,7 +240,8 @@ async function findRepeatedPatterns(page: Page, options: AnalyzerOptions): Promi
         groups.forEach(group => {
           if (group.elements.length >= minItems && group.classes.length >= 1) {
             const selector = `${tag}.${group.classes.join('.')}`;
-            const samples = group.elements.slice(0, 3).map(el => ({
+            // Sample more items for better diversity calculation (up to 10)
+            const samples = group.elements.slice(0, 10).map(el => ({
               html: el.outerHTML.substring(0, maxHtmlPreview),
               text: el.textContent?.substring(0, maxTextPreview),
               childCount: el.children.length
@@ -227,6 +283,15 @@ function selectBestPattern(patterns: DOMPattern[], options: AnalyzerOptions): DO
   if (filtered.length === 0) return null;
 
   const scored = filtered.map(p => {
+    // Content diversity score (0-1) - calculate first
+    const diversityScore = calculateDiversity(p.samples);
+
+    // If diversity is very low (all identical content), this is likely nav/UI elements
+    // Apply severe penalty that can't be overcome by count alone
+    if (diversityScore < 0.2) {
+      return { pattern: p, score: -100, diversityScore }; // Effectively disqualify
+    }
+
     let score = 0;
 
     // Count score (logarithmic - more items is better)
@@ -236,11 +301,55 @@ function selectBestPattern(patterns: DOMPattern[], options: AnalyzerOptions): DO
     const depthScore = Math.max(0, 10 - Math.abs(p.depth - CONFIG.IDEAL_DOM_DEPTH) * 2);
     score += depthScore;
 
-    return { pattern: p, score };
+    // Diversity bonus (reward varied content)
+    score += diversityScore * 15;
+
+    // Child count score (prefer elements with many children - actual content containers)
+    // Nav links typically have 0-2 children, content cards have 3+
+    const avgChildCount = p.samples.reduce((sum, s) => sum + s.childCount, 0) / p.samples.length;
+    const childScore = Math.min(avgChildCount / 3, 1) * 20; // Weight: 0-20 points (heavy)
+    score += childScore;
+
+    // Penalize anchor tags (usually navigation, not content containers)
+    if (p.selector.startsWith('a.')) {
+      score -= 15;
+    }
+
+    return { pattern: p, score, diversityScore };
   });
 
   scored.sort((a, b) => b.score - a.score);
+
   return scored[0].pattern;
+}
+
+/**
+ * Calculate content diversity score (0-1) based on sample text uniqueness.
+ * Returns 1.0 if all samples are unique, 0.0 if all samples are identical.
+ */
+function calculateDiversity(samples: PatternSample[]): number {
+  if (samples.length === 0) return 0;
+  if (samples.length === 1) return 1;
+
+  // Get text content from samples, normalized aggressively
+  // - Collapse whitespace
+  // - Truncate to first 50 chars (focus on primary content)
+  // - Lowercase
+  const texts = samples
+    .map(s => (s.text || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .substring(0, 50)
+      .toLowerCase()
+    )
+    .filter(t => t.length > 0);
+
+  if (texts.length === 0) return 0.5; // No text content - neutral score
+
+  const uniqueTexts = new Set(texts);
+  const diversity = uniqueTexts.size / texts.length;
+
+  return diversity;
 }
 
 // ============================================================================
